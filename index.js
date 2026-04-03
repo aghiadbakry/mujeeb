@@ -216,7 +216,19 @@ router.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
     const accessToken = signToken(row);
-    res.json({ accessToken, user: mapUser(row) });
+    const body = { accessToken, user: mapUser(row) };
+    if (!row.email_verified && exposeVerificationCodes) {
+      const code = String(Math.floor(1000 + Math.random() * 9000));
+      const codeHash = await bcrypt.hash(code, 10);
+      const expires = new Date(Date.now() + 15 * 60 * 1000);
+      await pool.query(
+        `UPDATE users SET verification_code_hash = $1, verification_expires_at = $2 WHERE id = $3`,
+        [codeHash, expires, row.id]
+      );
+      body.debugVerificationCode = code;
+      recordVerificationCode(row.email, code, "login");
+    }
+    res.json(body);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error" });
