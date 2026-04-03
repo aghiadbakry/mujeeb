@@ -1,4 +1,6 @@
 import "dotenv/config";
+import fs from "fs";
+import path from "path";
 import bcrypt from "bcryptjs";
 import cors from "cors";
 import express from "express";
@@ -12,11 +14,23 @@ const port = Number(process.env.PORT || 3000);
 const jwtSecret = process.env.JWT_SECRET || "dev-only-change-me";
 const nodeEnv = process.env.NODE_ENV || "development";
 const isProduction = nodeEnv === "production";
-/** Include debugVerificationCode / debugResetToken when not production or DEBUG_API=1 */
-const showDebugApi =
-  !isProduction || process.env.DEBUG_API === "1" || process.env.DEBUG_API === "true";
 
-/** If the app is mounted under a subpath (e.g. https://domain.com/api), set BASE_PATH=/api */
+/** When true, API responses include debugVerificationCode / debugResetToken and codes are logged. */
+const exposeVerificationCodes =
+  !isProduction ||
+  process.env.DEBUG_API === "1" ||
+  process.env.DEBUG_API === "true" ||
+  process.env.SHOW_VERIFICATION_CODE === "1" ||
+  process.env.SHOW_VERIFICATION_CODE === "true";
+
+/** Append human-readable lines to this file (relative to cwd) when LOG_VERIFICATION_CODES_TO_FILE=1 */
+const logCodesToFile =
+  process.env.LOG_VERIFICATION_CODES_TO_FILE === "1" ||
+  process.env.LOG_VERIFICATION_CODES_TO_FILE === "true";
+
+const verificationLogFile =
+  process.env.VERIFICATION_LOG_PATH?.trim() || path.join(process.cwd(), "verification-codes.log");
+
 const basePath = (process.env.BASE_PATH || "").replace(/\/$/, "") || "";
 
 function buildPoolConfig() {
@@ -116,8 +130,27 @@ function authMiddleware(req, res, next) {
   }
 }
 
+function recordVerificationCode(email, code, kind) {
+  const line = `${new Date().toISOString()}\t${kind}\t${email}\tcode=${code}\n`;
+  console.log(`[mujeeb-verification] ${kind} email=${email} code=${code}`);
+  if (logCodesToFile) {
+    try {
+      const dir = path.dirname(verificationLogFile);
+      if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(verificationLogFile, line, { encoding: "utf8" });
+    } catch (e) {
+      console.error("[mujeeb-verification] log file write failed:", e.message);
+    }
+  }
+}
+
 router.get("/health", (_req, res) => {
-  res.json({ ok: true, env: nodeEnv });
+  res.json({
+    ok: true,
+    env: nodeEnv,
+    verificationCodesExposed: exposeVerificationCodes,
+    verificationLogFile: logCodesToFile ? verificationLogFile : null,
+  });
 });
 
 router.post("/auth/register", async (req, res) => {
@@ -141,9 +174,23 @@ router.post("/auth/register", async (req, res) => {
        RETURNING id, email, display_name, email_verified`,
       [email, passwordHash, displayName, codeHash, expires]
     );
-    const accessToken = signToken({ ...rows[0], email_verified: false });
-    const body = { accessToken, user: mapUser(rows[0]) };
-    if (showDebugApi) body.debugVerificationCode = code;
+
+    const body = {
+      accessToken: signToken({ ...rows[0], email_verified: false }),
+      user: mapUser(rows[0]),
+    };
+
+    if (exposeVerificationCodes) {
+      body.debugVerificationCode = code;
+      recordVerificationCode(email, code, "register");
+    } else {
+      await pool.query(`DELETE FROM users WHERE id = $1`, [rows[0].id]);
+      return res.status(503).json({
+        error:
+          "Verification codes are hidden in production. Set SHOW_VERIFICATION_CODE=1 (or DEBUG_API=1) on the server.",
+      });
+    }
+
     res.status(201).json(body);
   } catch (e) {
     if (e.code === "23505") {
@@ -231,7 +278,7 @@ router.post("/auth/verify-email", authMiddleware, async (req, res) => {
 router.post("/auth/resend-verification", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, email_verified FROM users WHERE id = $1`,
+      `SELECT id, email, email_verified FROM users WHERE id = $1`,
       [req.userId]
     );
     const row = rows[0];
@@ -247,7 +294,15 @@ router.post("/auth/resend-verification", authMiddleware, async (req, res) => {
       [codeHash, expires, req.userId]
     );
     const body = { ok: true };
-    if (showDebugApi) body.debugVerificationCode = code;
+    if (exposeVerificationCodes) {
+      body.debugVerificationCode = code;
+      recordVerificationCode(row.email, code, "resend");
+    } else {
+      return res.status(503).json({
+        error:
+          "Verification codes are hidden in production. Set SHOW_VERIFICATION_CODE=1 (or DEBUG_API=1) on the server.",
+      });
+    }
     res.json(body);
   } catch (e) {
     console.error(e);
@@ -277,7 +332,21 @@ router.post("/auth/forgot-password", async (req, res) => {
       `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
       [row.id, tokenHash, expires]
     );
-    if (showDebugApi) {
+    if (exposeVerificationCodes) {
+      console.log(`[mujeeb-reset] email=${email} debugResetToken=${rawToken}`);
+      if (logCodesToFile) {
+        try {
+          const dir = path.dirname(verificationLogFile);
+          if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true });
+          fs.appendFileSync(
+            verificationLogFile,
+            `${new Date().toISOString()}\tforgot-password\t${email}\tresetToken=${rawToken}\n`,
+            { encoding: "utf8" }
+          );
+        } catch (e) {
+          console.error("[mujeeb-reset] log file write failed:", e.message);
+        }
+      }
       return res.json({ ...generic, debugResetToken: rawToken });
     }
     res.json(generic);
@@ -297,10 +366,7 @@ router.post("/auth/reset-password", async (req, res) => {
     if (!email || !token || newPassword.length < 6) {
       return res.status(400).json({ error: "Invalid input" });
     }
-    const { rows: users } = await pool.query(
-      `SELECT id FROM users WHERE email = $1`,
-      [email]
-    );
+    const { rows: users } = await pool.query(`SELECT id FROM users WHERE email = $1`, [email]);
     if (!users[0]) return res.status(400).json({ error: "Invalid or expired token" });
     const userId = users[0].id;
     const { rows: tokens } = await pool.query(
@@ -329,6 +395,13 @@ app.use(basePath || "/", router);
 const host = process.env.HOST || "0.0.0.0";
 const server = app.listen(port, host, () => {
   console.log(`API listening on http://${host}:${port}${basePath || ""}`);
+  console.log(
+    `[mujeeb] Verification codes: ${
+      exposeVerificationCodes
+        ? "ON (JSON + logs" + (logCodesToFile ? ` + file ${verificationLogFile}` : "") + ")"
+        : "OFF in production — set SHOW_VERIFICATION_CODE=1"
+    }`
+  );
 });
 
 function shutdown(signal) {
